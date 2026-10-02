@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,10 +34,51 @@ type ctxKey int
 
 const ctxSession ctxKey = iota
 
+// serverConfig 为不改变 NewServer 基本签名而引入的可选配置，
+// 全部通过 ServerOption 提供；零值时使用合理默认。
+type serverConfig struct {
+	maxLifetime        time.Duration
+	persistentIdleTTL  time.Duration
+	maxSessionsPerUser int
+}
+
+// ServerOption 以可选项方式扩展 NewServer，老调用方无需任何改动。
+type ServerOption func(*serverConfig)
+
+// WithMaxLifetime 设置会话最长存活时长：从建立起算，无论多活跃到期一律失效。
+func WithMaxLifetime(d time.Duration) ServerOption {
+	return func(c *serverConfig) { c.maxLifetime = d }
+}
+
+// WithPersistentIdleTTL 设置“保持长时间登录”会话的空闲时长。
+func WithPersistentIdleTTL(d time.Duration) ServerOption {
+	return func(c *serverConfig) { c.persistentIdleTTL = d }
+}
+
+// WithMaxSessionsPerUser 设置同一账号的活跃会话数量上限（<=0 表示不限制）。
+func WithMaxSessionsPerUser(n int) ServerOption {
+	return func(c *serverConfig) { c.maxSessionsPerUser = n }
+}
+
 // NewServer 装配各组件并注册路由。
-func NewServer(sessionTTL time.Duration, csrfSecret []byte, limiter *Limiter) *Server {
+// sessionTTL 为普通会话的空闲到期时长；新生命周期规则通过可变参数配置，
+// 缺省提供合理默认：最长存活 24 小时、保持登录空闲 7 天、不限制会话数量。
+func NewServer(sessionTTL time.Duration, csrfSecret []byte, limiter *Limiter, opts ...ServerOption) *Server {
+	cfg := serverConfig{
+		maxLifetime:       24 * time.Hour,
+		persistentIdleTTL: 7 * 24 * time.Hour,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	storeCfg := StoreConfig{
+		IdleTTL:            sessionTTL,
+		PersistentIdleTTL:  cfg.persistentIdleTTL,
+		MaxLifetime:        cfg.maxLifetime,
+		MaxSessionsPerUser: cfg.maxSessionsPerUser,
+	}
 	s := &Server{
-		sessions: NewStore(sessionTTL),
+		sessions: NewStoreWithConfig(storeCfg),
 		limiter:  limiter,
 		csrf:     NewCSRF(csrfSecret),
 		users:    make(map[string]User),
@@ -50,6 +92,10 @@ func NewServer(sessionTTL time.Duration, csrfSecret []byte, limiter *Limiter) *S
 	s.mux.HandleFunc("POST /documents", s.withSession(s.withCSRF(s.requirePerm("document", "write", s.handleDocuments))))
 	s.mux.HandleFunc("DELETE /documents", s.withSession(s.withCSRF(s.requirePerm("document", "delete", s.handleDocuments))))
 	s.mux.HandleFunc("GET /admin", s.withSession(s.requirePerm("admin-panel", "read", s.handleAdmin)))
+	// 多设备会话管理：查看当前账号的活跃会话、单独结束、一次全部结束。
+	s.mux.HandleFunc("GET /sessions", s.withSession(s.handleListSessions))
+	s.mux.HandleFunc("DELETE /sessions/{id}", s.withSession(s.withCSRF(s.handleRevokeSession)))
+	s.mux.HandleFunc("POST /sessions/revoke-all", s.withSession(s.withCSRF(s.handleRevokeAllSessions)))
 	return s
 }
 
@@ -124,6 +170,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		// Persistent 为可选的“保持长时间登录”；老客户端不带该字段时按普通会话处理。
+		Persistent bool `json:"remember_me"`
+		// DeviceLabel 为客户端自报的设备/客户端名；缺省时由 User-Agent 推导。
+		DeviceLabel string `json:"device_label"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body", "")
@@ -154,7 +204,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
 		s.sessions.Revoke(c.Value)
 	}
-	sess, err := s.sessions.Create(user.ID, user.Role)
+	sess, err := s.sessions.CreateSession(CreateMeta{
+		UserID:     user.ID,
+		Role:       user.Role,
+		Persistent: req.Persistent,
+		Device:     buildClientInfo(req.DeviceLabel, r, source),
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal error", "")
 		return
@@ -185,13 +240,52 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "logged out"})
 }
 
+// handleListSessions 返回当前账号在所有设备上的活跃会话。
+func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	sess := sessionFromContext(r)
+	list := s.sessions.List(sess.UserID, sess.ID)
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": list})
+}
+
+// handleRevokeSession 结束当前账号在某一台设备上的单条会话。
+// 只能结束自己账号下的会话；找不到或不属于本账号时统一 404，
+// 不泄露该会话是否存在、属于谁。
+func (s *Server) handleRevokeSession(w http.ResponseWriter, r *http.Request) {
+	sess := sessionFromContext(r)
+	targetID := r.PathValue("id")
+	if target, ok := s.sessions.Get(targetID); !ok || target.UserID != sess.UserID {
+		writeError(w, http.StatusNotFound, "session not found", ReasonSessionUnknown)
+		return
+	}
+	s.sessions.Revoke(targetID)
+	// 结束的是当前会话时，同步清除浏览器 Cookie。
+	if targetID == sess.ID {
+		http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "session revoked", "id": targetID})
+}
+
+// handleRevokeAllSessions 一次结束当前账号在所有设备上的会话（含当前会话）。
+func (s *Server) handleRevokeAllSessions(w http.ResponseWriter, r *http.Request) {
+	sess := sessionFromContext(r)
+	n := s.sessions.RevokeUser(sess.UserID)
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "all sessions revoked", "revoked": n})
+}
+
 func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
 	sess := sessionFromContext(r)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"user_id":    sess.UserID,
-		"role":       sess.Role,
-		"expires_at": sess.ExpiresAt.UTC().Format(time.RFC3339Nano),
-	})
+	resp := map[string]any{
+		"user_id":             sess.UserID,
+		"role":                sess.Role,
+		"persistent":          sess.Persistent,
+		"expires_at":          sess.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		"absolute_expires_at": nil,
+	}
+	if !sess.AbsoluteExpiresAt.IsZero() {
+		resp["absolute_expires_at"] = sess.AbsoluteExpiresAt.UTC().Format(time.RFC3339Nano)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleSensitive(w http.ResponseWriter, r *http.Request) {
@@ -216,6 +310,50 @@ func clientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// buildClientInfo 从客户端自报名称、User-Agent 与来源 IP 推导设备信息。
+// 老客户端不带 device_label、甚至不带 User-Agent 时也给出合理默认，保持可用。
+func buildClientInfo(label string, r *http.Request, ip string) ClientInfo {
+	ua := r.Header.Get("User-Agent")
+	if label == "" {
+		label = deviceLabelFromUA(ua)
+	}
+	return ClientInfo{Label: label, UserAgent: ua, IP: ip}
+}
+
+// deviceLabelFromUA 粗略地从 User-Agent 提取 “浏览器 @ 操作系统” 形式的标签。
+func deviceLabelFromUA(ua string) string {
+	if ua == "" {
+		return "未知设备"
+	}
+	browser := "未知浏览器"
+	switch {
+	case strings.Contains(ua, "Edg/"):
+		browser = "Edge"
+	case strings.Contains(ua, "OPR/"), strings.Contains(ua, "Opera"):
+		browser = "Opera"
+	case strings.Contains(ua, "Chrome/"):
+		browser = "Chrome"
+	case strings.Contains(ua, "Firefox/"):
+		browser = "Firefox"
+	case strings.Contains(ua, "Safari/"):
+		browser = "Safari"
+	}
+	osName := "未知系统"
+	switch {
+	case strings.Contains(ua, "Windows"):
+		osName = "Windows"
+	case strings.Contains(ua, "Android"):
+		osName = "Android"
+	case strings.Contains(ua, "iPhone"), strings.Contains(ua, "iPad"), strings.Contains(ua, "iOS"):
+		osName = "iOS"
+	case strings.Contains(ua, "Mac OS X"), strings.Contains(ua, "Macintosh"):
+		osName = "macOS"
+	case strings.Contains(ua, "Linux"), strings.Contains(ua, "X11"):
+		osName = "Linux"
+	}
+	return browser + " @ " + osName
 }
 
 func contextWithSession(r *http.Request, sess *Session) *http.Request {

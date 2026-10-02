@@ -16,7 +16,17 @@ func main() {
 	}
 	// 5 分钟内同一 (来源, 账号) 失败 5 次，锁定 1 分钟。
 	limiter := auth.NewLimiter(5, 5*time.Minute, time.Minute)
-	srv := auth.NewServer(30*time.Minute, secret, limiter)
+	// 会话生命周期：空闲 30 分钟失效；选择“保持长时间登录”时间放宽到 7 天；
+	// 无论多活跃，最长存活 30 天一律失效；同一账号最多 5 条活跃会话，
+	// 超出时最久未活动的会话让位。
+	srv := auth.NewServer(
+		30*time.Minute,
+		secret,
+		limiter,
+		auth.WithPersistentIdleTTL(7*24*time.Hour),
+		auth.WithMaxLifetime(30*24*time.Hour),
+		auth.WithMaxSessionsPerUser(5),
+	)
 
 	must := func(err error) {
 		if err != nil {

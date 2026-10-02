@@ -32,13 +32,23 @@ type authClient struct {
 	handler   http.Handler
 	sessionID string
 	csrfToken string
+	device    string
+	ua        string
 }
 
 func (c *authClient) login(username, password string) *httptest.ResponseRecorder {
 	body := fmt.Sprintf(`{"username":%q,"password":%q}`, username, password)
+	return c.loginBody(body)
+}
+
+// loginBody 发送自定义 JSON 登录体（可携带 remember_me / device_label）。
+func (c *authClient) loginBody(body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest("POST", "/login", strings.NewReader(body))
 	if c.sessionID != "" {
 		req.AddCookie(&http.Cookie{Name: sessionCookie, Value: c.sessionID})
+	}
+	if c.ua != "" {
+		req.Header.Set("User-Agent", c.ua)
 	}
 	rec := httptest.NewRecorder()
 	c.handler.ServeHTTP(rec, req)

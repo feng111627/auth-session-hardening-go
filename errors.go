@@ -10,8 +10,13 @@ const (
 	ReasonBadCredentials Reason = "bad_credentials"
 	ReasonRateLimited    Reason = "rate_limited"
 	ReasonCSRFInvalid    Reason = "csrf_invalid"
+	// ReasonSessionExpired 表示空闲到期（一段时间不活动）。
 	ReasonSessionExpired Reason = "session_expired"
-	ReasonSessionRevoked Reason = "session_revoked"
+	// ReasonSessionAbsoluteExpired 表示达到最长存活时长（无论多活跃）。
+	ReasonSessionAbsoluteExpired Reason = "session_absolute_expired"
+	ReasonSessionRevoked         Reason = "session_revoked"
+	// ReasonSessionEvicted 表示因账号会话数达上限被让位淘汰。
+	ReasonSessionEvicted Reason = "session_evicted"
 	ReasonSessionUnknown Reason = "session_unknown"
 	ReasonForbidden      Reason = "forbidden"
 )
