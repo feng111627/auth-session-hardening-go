@@ -17,6 +17,18 @@ type User struct {
 	Role         Role
 }
 
+// ServerConfig 配置会话生命周期与多设备策略。
+type ServerConfig struct {
+	// IdleTTL 普通会话滑动空闲时长。
+	IdleTTL time.Duration
+	// PersistentIdleTTL “保持长时间登录”会话的空闲时长（<=0 回退 IdleTTL）。
+	PersistentIdleTTL time.Duration
+	// AbsoluteTTL 所有会话统一的最长存活时长（<=0 表示不限制）。
+	AbsoluteTTL time.Duration
+	// MaxSessionsPerUser 每账号活跃会话上限（<=0 表示不限制）。
+	MaxSessionsPerUser int
+}
+
 // Server 组合会话、限流、CSRF 与鉴权，提供 HTTP 处理器。
 type Server struct {
 	sessions *Store
@@ -33,14 +45,40 @@ type ctxKey int
 
 const ctxSession ctxKey = iota
 
-// NewServer 装配各组件并注册路由。
+// NewServer 装配各组件并注册路由（旧签名，保持旧语义：
+// 仅滑动空闲续期，不启用最长存活上限、长登录放宽与每账号会话上限）。
 func NewServer(sessionTTL time.Duration, csrfSecret []byte, limiter *Limiter) *Server {
+	return newServerRaw(ServerConfig{IdleTTL: sessionTTL}, csrfSecret, limiter)
+}
+
+// NewServerWithConfig 按完整配置装配各组件并注册路由；
+// 未设置的时长字段归一化为合理默认，保证零值配置也可直接使用。
+func NewServerWithConfig(cfg ServerConfig, csrfSecret []byte, limiter *Limiter) *Server {
+	if cfg.IdleTTL <= 0 {
+		cfg.IdleTTL = 30 * time.Minute
+	}
+	if cfg.PersistentIdleTTL <= 0 {
+		cfg.PersistentIdleTTL = 7 * 24 * time.Hour
+	}
+	if cfg.AbsoluteTTL <= 0 {
+		cfg.AbsoluteTTL = 12 * time.Hour
+	}
+	return newServerRaw(cfg, csrfSecret, limiter)
+}
+
+// newServerRaw 按给定配置原样装配；零值时长按 Store 的“不限制”语义处理。
+func newServerRaw(cfg ServerConfig, csrfSecret []byte, limiter *Limiter) *Server {
 	s := &Server{
-		sessions: NewStore(sessionTTL),
-		limiter:  limiter,
-		csrf:     NewCSRF(csrfSecret),
-		users:    make(map[string]User),
-		mux:      http.NewServeMux(),
+		sessions: NewStoreWithConfig(StoreConfig{
+			IdleTTL:            cfg.IdleTTL,
+			PersistentIdleTTL:  cfg.PersistentIdleTTL,
+			AbsoluteTTL:        cfg.AbsoluteTTL,
+			MaxSessionsPerUser: cfg.MaxSessionsPerUser,
+		}),
+		limiter: limiter,
+		csrf:    NewCSRF(csrfSecret),
+		users:   make(map[string]User),
+		mux:     http.NewServeMux(),
 	}
 	s.mux.HandleFunc("POST /login", s.handleLogin)
 	s.mux.HandleFunc("POST /logout", s.withSession(s.handleLogout))
@@ -50,6 +88,10 @@ func NewServer(sessionTTL time.Duration, csrfSecret []byte, limiter *Limiter) *S
 	s.mux.HandleFunc("POST /documents", s.withSession(s.withCSRF(s.requirePerm("document", "write", s.handleDocuments))))
 	s.mux.HandleFunc("DELETE /documents", s.withSession(s.withCSRF(s.requirePerm("document", "delete", s.handleDocuments))))
 	s.mux.HandleFunc("GET /admin", s.withSession(s.requirePerm("admin-panel", "read", s.handleAdmin)))
+	// 多设备会话管理。
+	s.mux.HandleFunc("GET /sessions", s.withSession(s.handleListSessions))
+	s.mux.HandleFunc("DELETE /sessions/{id}", s.withSession(s.withCSRF(s.handleRevokeSession)))
+	s.mux.HandleFunc("POST /sessions/revoke-all", s.withSession(s.withCSRF(s.handleRevokeAllSessions)))
 	return s
 }
 
@@ -124,6 +166,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		// Persistent 为可选的“保持长时间登录”：缺省（老客户端不带）按普通会话处理。
+		Persistent bool `json:"persistent"`
+		// DeviceLabel 为客户端可自报的设备名，仅用于多设备会话展示，可缺省。
+		DeviceLabel string `json:"device_label"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body", "")
@@ -154,7 +200,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
 		s.sessions.Revoke(c.Value)
 	}
-	sess, err := s.sessions.Create(user.ID, user.Role)
+	// 设备信息：IP/User-Agent 由服务端采集，标签由客户端自报；
+	// 老客户端不带任何新字段时 ClientInfo 为零值，会话照常建立。
+	client := ClientInfo{
+		UserAgent: r.UserAgent(),
+		IP:        source,
+		Label:     req.DeviceLabel,
+	}
+	sess, err := s.sessions.CreateWithClient(user.ID, user.Role, client, req.Persistent)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal error", "")
 		return
@@ -172,9 +225,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteStrictMode,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
-		"username":   user.Username,
-		"role":       user.Role,
-		"csrf_token": token,
+		"username":            user.Username,
+		"role":                user.Role,
+		"csrf_token":          token,
+		"persistent":          sess.Persistent,
+		"absolute_expires_at": rfc3339(sess.AbsoluteExpiresAt),
 	})
 }
 
@@ -188,10 +243,70 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
 	sess := sessionFromContext(r)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"user_id":    sess.UserID,
-		"role":       sess.Role,
-		"expires_at": sess.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		"user_id":             sess.UserID,
+		"role":                sess.Role,
+		"persistent":          sess.Persistent,
+		"expires_at":          rfc3339(sess.ExpiresAt),
+		"absolute_expires_at": rfc3339(sess.AbsoluteExpiresAt),
+		"last_active_at":      rfc3339(sess.LastActiveAt),
 	})
+}
+
+// sessionView 是多设备会话列表对外暴露的单条视图。
+type sessionView struct {
+	ID           string `json:"id"`
+	DeviceLabel  string `json:"device_label"`
+	UserAgent    string `json:"user_agent"`
+	IP           string `json:"ip"`
+	LoginAt      string `json:"login_at"`
+	LastActiveAt string `json:"last_active_at"`
+	ExpiresAt    string `json:"expires_at"`
+	Current      bool   `json:"current"`
+}
+
+// handleListSessions 列出当前账号全部活跃会话（多设备）。
+func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	cur := sessionFromContext(r)
+	active := s.sessions.ListActive(cur.UserID)
+	views := make([]sessionView, 0, len(active))
+	for _, sess := range active {
+		views = append(views, sessionView{
+			ID:           sess.ID,
+			DeviceLabel:  sess.Client.Label,
+			UserAgent:    sess.Client.UserAgent,
+			IP:           sess.Client.IP,
+			LoginAt:      rfc3339(sess.CreatedAt),
+			LastActiveAt: rfc3339(sess.LastActiveAt),
+			ExpiresAt:    rfc3339(sess.ExpiresAt),
+			Current:      sess.ID == cur.ID,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": views})
+}
+
+// handleRevokeSession 结束指定的单条会话；仅允许结束本账号会话。
+// 目标不存在、属于他人或已失效时返回统一 404，不泄露会话归属。
+func (s *Server) handleRevokeSession(w http.ResponseWriter, r *http.Request) {
+	cur := sessionFromContext(r)
+	targetID := r.PathValue("id")
+	target, ok := s.sessions.Get(targetID)
+	if !ok || target.UserID != cur.UserID {
+		writeError(w, http.StatusNotFound, "session not found", ReasonSessionUnknown)
+		return
+	}
+	if !target.Revoked && !target.Evicted {
+		s.sessions.Revoke(targetID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "session ended"})
+}
+
+// handleRevokeAllSessions 一次结束当前账号在所有设备上的会话，
+// 包括发起请求的当前会话；其它账号不受影响。
+func (s *Server) handleRevokeAllSessions(w http.ResponseWriter, r *http.Request) {
+	cur := sessionFromContext(r)
+	n := s.sessions.RevokeUser(cur.UserID, "")
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "all sessions ended", "ended": n})
 }
 
 func (s *Server) handleSensitive(w http.ResponseWriter, r *http.Request) {
@@ -216,6 +331,14 @@ func clientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// rfc3339 统一时间输出；零值时间输出空串（表示该到期线未启用）。
+func rfc3339(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 func contextWithSession(r *http.Request, sess *Session) *http.Request {
