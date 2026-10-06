@@ -50,11 +50,26 @@
 
 ### 每账号会话上限与淘汰
 - 活跃会话数有每账号上限（`MaxSessionsPerUser`，可配置，`<=0` 表示不限制）。
-  新登录导致超过上限时，**最久未活动（LRU）的会话先让位**；空闲时间并列时
-  建立更早者让位，因此刚建立的新会话绝不会被误伤。
-- 并发登录在同一把锁内串行完成检查与淘汰：上限**绝不被突破**，
-  被让位会话立即失效（`session_evicted`），该账号其余会话继续可用，
-  不同账号名额相互独立。已撤销/已到期（任一条线）的会话不占用名额。
+  新登录导致超过上限时，**最久未活动（LRU）的会话先让位**；最近活动时间并列时
+  建立更早者让位。
+- **并发登录语义（本次修复加固）：**
+  - 时间戳在会话存储的互斥锁**内部**取样，与序号分配、淘汰判定是同一个原子动作；
+    并发登录按拿锁顺序得到严格不逆序的“建立时间/最近活动时间”，不会因为
+    先取时间、后拿锁的调度错位，让更晚建立的会话反而拿着更老的时间戳。
+  - 每次上限处理显式**排除本次刚建立的会话**，它在任何时钟条件下都不参与
+    牺牲品选择。因此“登录接口返回成功”与“新会话立即可用”是原子的：
+    客户端拿到会话凭据后访问受保护接口，绝不会因为自己这次登录触发的淘汰
+    而被要求重新登录。
+  - 无论并发多高，登录潮结束后：活跃数**恰好等于上限**（绝不突破）；
+    最终存活集合稳定为该账号**最近建立（等价于最近活动）的那几条**；
+    不会出现更早建立、更久没活动的会话把更晚建立、刚活跃过的会话清掉。
+  - 被让位的会话**立即失效**，后续请求统一返回 401 文案
+    `authentication required`（内部原因 `session_evicted`），
+    不泄露账号信息；同账号其它会话与其它账号的会话继续正常使用，
+    不同账号名额相互独立。已撤销/已到期（任一条线）的会话不占用名额。
+- “保持长时间登录”只放宽空闲时长，**上限与淘汰规则完全相同**；
+  老客户端不带新字段、或上限未配置/尚未达到时，不引入任何新的淘汰，
+  行为与之前一致。
 
 ### CSRF（csrf.go）
 - 登录响应下发 CSRF 令牌：`<nonce>.<HMAC(nonce|sessionID)>`。
@@ -91,6 +106,13 @@ go test -v ./...
 
 # 并发安全验证
 go test -race ./...
+
+# 并发登录上限场景（高并发、多轮；含存储层与 HTTP 端到端）
+# 存储层：登录潮后活跃数恒等于上限、最后建立的会话全部存活、
+#        被让位者立即 session_evicted、长登录同规则、账号间隔离；
+# HTTP 层：每个登录成功拿到的 Cookie 立即访问 /profile 必须可用，
+#        被让位客户端得到统一 401 文案（不泄露账号信息）。
+go test -race -v -run 'TestConcurrentCap' -count=10 ./...
 
 # 启动服务（内置 admin/alice/bob 三个账号，口令均为 <用户名>-secret 变体，见 cmd/server/main.go）
 go run ./cmd/server
@@ -146,8 +168,8 @@ curl -b jar -X POST localhost:8080/sessions/revoke-all \
 | 老客户端缺省兼容     | `TestLifecyclePersistentDefaultsFalse`、`TestServerLegacyClientDefaults` |
 | 多设备会话查看       | `TestDevicesListSessions`、`TestServerListDevices`          |
 | 多设备单独/全部结束  | `TestDevicesRevokeSingle`、`TestDevicesRevokeAll`、`TestDevicesRevokeOthersExceptCurrent`、`TestServerRevokeOneDevice`、`TestServerRevokeAllDevices`、`TestServerCannotRevokeOthersSession` |
-| 会话上限与 LRU 淘汰  | `TestCapEvictsLeastRecentlyActive`、`TestCapIsolationAndExpiredDoNotCount`、`TestServerDeviceCapEviction` |
-| 并发登录上限         | `TestCapConcurrentLogins`、`TestServerDeviceCapConcurrent`  |
+| 会话上限与 LRU 淘汰  | `TestCapEvictsLeastRecentlyActive`、`TestCapIsolationAndExpiredDoNotCount`、`TestCapSameInstantTieBreak`、`TestCapOnePerUserKeepsOnlyNewSession`、`TestServerDeviceCapEviction` |
+| 并发登录上限         | `TestConcurrentCapBurst`（普通/长登录/顶掉既有会话/账号隔离 4 用例，10 轮 × 64 并发）、`TestConcurrentCapHTTPLoginImmediatelyUsable`（HTTP 端到端，5 轮 × 24 并发，登录凭据立即可用）、`TestCapConcurrentLogins`、`TestServerDeviceCapConcurrent`  |
 | 会话并发续期         | `TestSessionConcurrentTouch`、`TestServerConcurrentRenewal` |
 | 滑动续期             | `TestSessionSlidingRenewal`                                 |
 | 过期/撤销            | `TestSessionExpiry`、`TestSessionRevoke`、`TestServerLogoutRevokes` |

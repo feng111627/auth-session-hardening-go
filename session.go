@@ -127,6 +127,12 @@ func (s *Store) CreateWithClient(userID string, role Role, client ClientInfo, pe
 	if err != nil {
 		return nil, err
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 时间戳必须在锁内取样：与 seq、淘汰判定构成同一个原子动作。
+	// 若在锁外取样，先取样、后拿锁的并发登录会拿到“更老”的时间戳，
+	// 其刚建立的会话反而可能被这次上限处理顶掉（登录成功却立刻掉线）。
 	now := s.now()
 	sess := &Session{
 		ID:           id,
@@ -154,20 +160,22 @@ func (s *Store) CreateWithClient(userID string, role Role, client ClientInfo, pe
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	sess.seq = s.nextSeq
 	s.nextSeq++
 	s.sessions[id] = sess
-	s.enforceMaxLocked(userID, now)
+	// 同一次上限处理绝不允许淘汰刚建立的会话：登录成功即立即可用。
+	s.enforceMaxLocked(userID, now, id)
 	cp := *sess
 	return &cp, nil
 }
 
 // enforceMaxLocked 在锁内执行每账号活跃会话上限淘汰：
-// 超过上限时让“最久未活动”的会话先让位；空闲时间并列时建立更早者让位，
-// 因此刚建立的会话（LastActiveAt=now、seq 最大）绝不会被误伤。
-func (s *Store) enforceMaxLocked(userID string, now time.Time) {
+// 超过上限时让“最久未活动”的会话先让位；最近活动时间并列时建立更早者让位。
+//
+// keepID 为本次新建会话：它在任何情况下都不参与牺牲品选择，
+// 因此“登录成功”与“新会话立即可用”是同一次原子操作，不可能刚签发就被顶掉。
+// 牺牲品只在其余会话中产生，淘汰数量不变，活跃总数仍严格不超过上限。
+func (s *Store) enforceMaxLocked(userID string, now time.Time, keepID string) {
 	if s.maxPerUser <= 0 {
 		return
 	}
@@ -178,12 +186,21 @@ func (s *Store) enforceMaxLocked(userID string, now time.Time) {
 		}
 	}
 	for len(active) > s.maxPerUser {
-		victim := active[0]
-		for _, cand := range active[1:] {
-			if cand.LastActiveAt.Before(victim.LastActiveAt) ||
+		var victim *Session
+		for _, cand := range active {
+			if cand.ID == keepID {
+				// 刚建立的会话绝不作为牺牲品。
+				continue
+			}
+			if victim == nil ||
+				cand.LastActiveAt.Before(victim.LastActiveAt) ||
 				(cand.LastActiveAt.Equal(victim.LastActiveAt) && cand.seq < victim.seq) {
 				victim = cand
 			}
+		}
+		if victim == nil {
+			// 理论上不可达：超上限时除 keepID 外必有可淘汰会话。
+			return
 		}
 		victim.Evicted = true
 		next := active[:0]

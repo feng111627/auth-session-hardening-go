@@ -308,6 +308,56 @@ func TestCapIsolationAndExpiredDoNotCount(t *testing.T) {
 	t.Log("用例通过: 过期会话不占上限名额，淘汰仅作用于同账号")
 }
 
+// 业务：会话上限 —— 同刻并列登录时淘汰建立最早者，最晚建立的会话存活
+// （时钟分辨率较粗、一批登录 LastActiveAt 完全相同的情形）
+func TestCapSameInstantTieBreak(t *testing.T) {
+	store := NewStoreWithConfig(StoreConfig{
+		IdleTTL:            time.Hour,
+		MaxSessionsPerUser: 2,
+	})
+	now := time.Now()
+	store.now = func() time.Time { return now }
+
+	s1, _ := store.CreateWithClient("u1", RoleMember, ClientInfo{Label: "同刻-1"}, false)
+	s2, _ := store.CreateWithClient("u1", RoleMember, ClientInfo{Label: "同刻-2"}, false)
+	s3, _ := store.CreateWithClient("u1", RoleMember, ClientInfo{Label: "同刻-3"}, false)
+
+	if _, err := store.Touch(s1.ID); ReasonOf(err) != ReasonSessionEvicted {
+		t.Fatalf("同刻下建立最早的 s1 应让位，实际 %v", err)
+	}
+	if _, err := store.Touch(s2.ID); err != nil {
+		t.Fatalf("s2 应存活: %v", err)
+	}
+	if _, err := store.Touch(s3.ID); err != nil {
+		t.Fatalf("最晚建立的 s3 应存活: %v", err)
+	}
+	t.Log("用例通过: 同刻并发登录时建立更早者让位，最后建立的两条存活")
+}
+
+// 业务：会话上限 —— 上限为 1 的极端配置下，仅本次新建会话存活且立即可用
+func TestCapOnePerUserKeepsOnlyNewSession(t *testing.T) {
+	store := NewStoreWithConfig(StoreConfig{
+		IdleTTL:            time.Hour,
+		MaxSessionsPerUser: 1,
+	})
+	now := time.Now()
+	store.now = func() time.Time { return now }
+
+	s1, _ := store.CreateWithClient("u1", RoleMember, ClientInfo{Label: "旧"}, false)
+	s2, _ := store.CreateWithClient("u1", RoleMember, ClientInfo{Label: "新"}, false)
+
+	if _, err := store.Touch(s1.ID); ReasonOf(err) != ReasonSessionEvicted {
+		t.Fatalf("旧会话应让位: %v", err)
+	}
+	if _, err := store.Touch(s2.ID); err != nil {
+		t.Fatalf("上限为 1 时新会话也必须立即可用: %v", err)
+	}
+	if got := len(store.ListActive("u1")); got != 1 {
+		t.Fatalf("活跃数必须恰好为 1，实际 %d", got)
+	}
+	t.Log("用例通过: 上限为 1 时旧会话让位，本次登录的新会话唯一存活且立即可用")
+}
+
 // 业务：会话上限 —— 并发登录不突破上限、不误伤刚建立的会话
 func TestCapConcurrentLogins(t *testing.T) {
 	const max = 3
