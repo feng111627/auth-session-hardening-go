@@ -401,3 +401,56 @@ func TestServerExpiryLinesHTTP(t *testing.T) {
 	}
 	t.Log("用例通过: 两种到期对外都是统一 401 文案，内部原因分别可辨")
 }
+
+// 业务：会话上限（HTTP 并发回归）—— 并发登录顶到上限时，
+// 登录成功的会话不立即掉线：活跃数恰好为上限，存活会话立即可用，
+// 被让位会话立即 401 且对外文案不泄露账号信息。
+func TestServerDeviceCapConcurrentUsable(t *testing.T) {
+	srv := newFeatureServer(t, 3)
+	const n = 24
+	clients := make([]*authClient, n)
+	start := make(chan struct{}) // 发令枪：让所有登录请求同时涌入
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		clients[i] = &authClient{t: t, handler: srv.Handler()}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			rec := clients[i].loginAsDevice(t, "alice", "alice-pass",
+				fmt.Sprintf("并发-%d", i))
+			if rec.Code != http.StatusOK {
+				t.Errorf("登录 %d 应成功，实际 %d body %s", i, rec.Code, rec.Body)
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	// 并发登录结束后：恰好 max 条会话存活且立即可用；
+	// 其余会话已被让位，访问一律 401 统一文案。
+	alive, evicted := 0, 0
+	for i, c := range clients {
+		rec := c.do("GET", "/profile", false)
+		switch rec.Code {
+		case http.StatusOK:
+			alive++
+		case http.StatusUnauthorized:
+			evicted++
+			body := rec.Body.String()
+			if !strings.Contains(body, "authentication required") {
+				t.Errorf("设备 %d: 被让位后应返回统一 401 文案，实际 %s", i, body)
+			}
+			if strings.Contains(body, "alice") {
+				t.Errorf("设备 %d: 401 响应不得泄露账号信息，实际 %s", i, body)
+			}
+		default:
+			t.Errorf("设备 %d: 预期 200 或 401，实际 %d body %s", i, rec.Code, rec.Body)
+		}
+	}
+	if alive != 3 {
+		t.Fatalf("并发登录后存活会话应恰好为上限 3，实际 %d（被拒 %d）", alive, evicted)
+	}
+	t.Logf("用例通过: %d 台并发登录全部成功，最终 %d 台存活且立即可用，%d 台被让位立即 401 统一文案",
+		n, alive, evicted)
+}

@@ -55,6 +55,19 @@
 - 并发登录在同一把锁内串行完成检查与淘汰：上限**绝不被突破**，
   被让位会话立即失效（`session_evicted`），该账号其余会话继续可用，
   不同账号名额相互独立。已撤销/已到期（任一条线）的会话不占用名额。
+- **并发登录下的行为语义**（回归修复后明确保证）：
+  - 会话的建立时间戳与淘汰序号在**同一把锁内**捕获，二者严格同序；
+    因此“最久未活动”的判定在任意并发交错下都与真实建立顺序一致。
+  - **登录成功即可用**：只要登录接口返回成功，这条刚建立的会话绝不会
+    被本次（或与之并发的）上限处理顶掉——它一定是同账号最近活动的会话之一。
+  - 一批并发登录结束后，最终存活的稳定为该账号**最近建立、最近活动**的
+    `MaxSessionsPerUser` 条会话；不会出现更早建立、更久未活动的会话
+    反而把更晚建立的会话清掉。
+  - 被让位的会话**立即**不可用：后续请求统一返回 401
+    `authentication required`（内部原因 `session_evicted`），
+    不泄露账号信息；同账号其它会话不受影响。
+  - “保持长时间登录”的会话同样遵守上限与 LRU 淘汰（放宽的只是空闲时长）；
+    上限未配置（`<=0`）或尚未达到时，不发生任何淘汰，行为与旧版一致。
 
 ### CSRF（csrf.go）
 - 登录响应下发 CSRF 令牌：`<nonce>.<HMAC(nonce|sessionID)>`。
@@ -91,6 +104,9 @@ go test -v ./...
 
 # 并发安全验证
 go test -race ./...
+
+# 并发登录上限回归（高并发 × 多轮，稳定复现“登录成功即掉线”场景）
+go test -v -run 'TestCapConcurrentLoginSurvivorsAreNewest' -count=5 .
 
 # 启动服务（内置 admin/alice/bob 三个账号，口令均为 <用户名>-secret 变体，见 cmd/server/main.go）
 go run ./cmd/server
@@ -146,8 +162,8 @@ curl -b jar -X POST localhost:8080/sessions/revoke-all \
 | 老客户端缺省兼容     | `TestLifecyclePersistentDefaultsFalse`、`TestServerLegacyClientDefaults` |
 | 多设备会话查看       | `TestDevicesListSessions`、`TestServerListDevices`          |
 | 多设备单独/全部结束  | `TestDevicesRevokeSingle`、`TestDevicesRevokeAll`、`TestDevicesRevokeOthersExceptCurrent`、`TestServerRevokeOneDevice`、`TestServerRevokeAllDevices`、`TestServerCannotRevokeOthersSession` |
-| 会话上限与 LRU 淘汰  | `TestCapEvictsLeastRecentlyActive`、`TestCapIsolationAndExpiredDoNotCount`、`TestServerDeviceCapEviction` |
-| 并发登录上限         | `TestCapConcurrentLogins`、`TestServerDeviceCapConcurrent`  |
+| 会话上限与 LRU 淘汰  | `TestCapEvictsLeastRecentlyActive`、`TestCapIsolationAndExpiredDoNotCount`、`TestCapPersistentSessionStillEvicted`、`TestServerDeviceCapEviction` |
+| 并发登录上限         | `TestCapConcurrentLogins`、`TestCapConcurrentLoginSurvivorsAreNewest`、`TestServerDeviceCapConcurrent`、`TestServerDeviceCapConcurrentUsable` |
 | 会话并发续期         | `TestSessionConcurrentTouch`、`TestServerConcurrentRenewal` |
 | 滑动续期             | `TestSessionSlidingRenewal`                                 |
 | 过期/撤销            | `TestSessionExpiry`、`TestSessionRevoke`、`TestServerLogoutRevokes` |

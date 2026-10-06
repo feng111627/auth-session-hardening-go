@@ -122,11 +122,17 @@ func (s *Store) Create(userID string, role Role) (*Session, error) {
 //
 // persistent 为“保持长时间登录”：空闲时长使用放宽值，最长存活时长不变。
 // 若同账号活跃会话已达上限，立即让最久未活动的会话失效（新会话不受影响）。
+//
+// 并发安全要点：建立时间戳在锁内捕获，与淘汰序号同序——并发登录时锁的获取
+// 顺序就是时间戳顺序，刚建立的会话 LastActiveAt 绝不早于任何已存在会话，
+// 因此绝不会在本次上限处理中被当成“最久未活动”误淘汰（登录成功即可用）。
 func (s *Store) CreateWithClient(userID string, role Role, client ClientInfo, persistent bool) (*Session, error) {
 	id, err := newSessionID()
 	if err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	now := s.now()
 	sess := &Session{
 		ID:           id,
@@ -154,20 +160,20 @@ func (s *Store) CreateWithClient(userID string, role Role, client ClientInfo, pe
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	sess.seq = s.nextSeq
 	s.nextSeq++
 	s.sessions[id] = sess
-	s.enforceMaxLocked(userID, now)
+	s.enforceMaxLocked(userID, now, sess.ID)
 	cp := *sess
 	return &cp, nil
 }
 
 // enforceMaxLocked 在锁内执行每账号活跃会话上限淘汰：
-// 超过上限时让“最久未活动”的会话先让位；空闲时间并列时建立更早者让位，
-// 因此刚建立的会话（LastActiveAt=now、seq 最大）绝不会被误伤。
-func (s *Store) enforceMaxLocked(userID string, now time.Time) {
+// 超过上限时让“最久未活动”的会话先让位；空闲时间并列时建立更早者让位。
+// protectID 为刚建立的会话：双保险，任何情况下都不会被选为让位者，
+// 保证“登录成功即可用”。由于建立时间戳与淘汰序号同序（见 CreateWithClient），
+// 正常流程下它本就不会是最久未活动者。
+func (s *Store) enforceMaxLocked(userID string, now time.Time, protectID string) {
 	if s.maxPerUser <= 0 {
 		return
 	}
@@ -178,12 +184,20 @@ func (s *Store) enforceMaxLocked(userID string, now time.Time) {
 		}
 	}
 	for len(active) > s.maxPerUser {
-		victim := active[0]
-		for _, cand := range active[1:] {
-			if cand.LastActiveAt.Before(victim.LastActiveAt) ||
+		var victim *Session
+		for _, cand := range active {
+			if cand.ID == protectID {
+				continue
+			}
+			if victim == nil ||
+				cand.LastActiveAt.Before(victim.LastActiveAt) ||
 				(cand.LastActiveAt.Equal(victim.LastActiveAt) && cand.seq < victim.seq) {
 				victim = cand
 			}
+		}
+		if victim == nil {
+			// 仅剩受保护的刚建立会话：不淘汰，直接退出。
+			break
 		}
 		victim.Evicted = true
 		next := active[:0]
